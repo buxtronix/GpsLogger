@@ -1,3 +1,28 @@
+#include <TinyGPS.h>
+/*
+  15 June 2014
+  Ben Buxton (www.buxtronix.net)
+
+  Modifications to OpenLog which allow it to run as an efficient Gps Logger.
+
+  Requirements: 
+
+    - TinyGps: https://github.com/mikalhart/TinyGPS
+    - Sparkfun GPS Micro Mini [discontinued]
+
+  Main differences with OpenLog:
+
+  - Parses serial stream for NMEA sentences (via tinygps)
+  - When [some] valid GPS fixes are detected, sends a pulse to PC1.
+    - This powers down the GPS unit (standby mode, so maintains almanac, ephemeris, etc)
+  - Starts a 60s timer.
+  - After 60s, sends a pulse to PC1 to wake up the GPS.
+  - Lather, rinse, repeat.
+
+  - [If GPS is expected to be on, but no data is received after a timeout,
+     resends the pulse in case GPS module status is out of sync]
+ */
+
 /*
  12-3-09
  Nathan Seidle
@@ -130,6 +155,8 @@ SerialPort<0, 800, 0> NewSerial;
 //1000 works on light,
 //900 works on light and is able to create config file
 
+TinyGPS gps;
+
 #include <avr/sleep.h> //Needed for sleep_mode
 #include <avr/power.h> //Needed for powering down perihperals such as the ADC/TWI and Timers
 
@@ -169,21 +196,6 @@ SerialPort<0, 800, 0> NewSerial;
 #define MODE_SEQLOG     1
 #define MODE_COMMAND    2
 
-//STAT1 is a general LED and indicates serial traffic
-#define STAT1  5 //On PORTD
-#define STAT1_PORT  PORTD
-#define STAT2  5 //On PORTB
-#define STAT2_PORT  PORTB
-const byte statled1 = 5;  //This is the normal status LED
-const byte statled2 = 13; //This is the SPI LED, indicating SD traffic
-
-//Blinking LED error codes
-#define ERROR_SD_INIT	  3
-#define ERROR_NEW_BAUD	  5
-#define ERROR_CARD_INIT   6
-#define ERROR_VOLUME_INIT 7
-#define ERROR_ROOT_INIT   8
-#define ERROR_FILE_OPEN   9
 
 #define OFF   0x00
 #define ON    0x01
@@ -200,52 +212,37 @@ byte setting_verbose; //This controls the whether we get extended or simple resp
 byte setting_echo; //This turns on/off echoing at the command prompt
 byte setting_ignore_RX; //This flag, when set to 1 will make OpenLog ignore the state of the RX pin when powering up
 
-//Passes back the available amount of free RAM
-int freeRam () 
-{
-#if RAM_TESTING
-  extern int __heap_start, *__brkval; 
-  int v; 
-  return (int) &v - (__brkval == 0 ? (int) &__heap_start : (int) __brkval); 
-#endif
-}
-void printRam() 
-{
-#if RAM_TESTING
-  NewSerial.print(F(" RAM:"));
-  NewSerial.println(freeRam());
-#endif
-}
+// Some GPS related variables and defines.
+byte gps_next_wake_secs;  // how many seconds before waking the GPS.
+long gps_wake_time_millis;  // Time since GPS wake signal sent.
+byte gps_fix_count;  // How many GPS fixes received (since wake)
+#define GPS_PORT PORTC  // PC1
+#define GPS_PIN 1 // PC1
+const byte gps_pin = 15;
+#define MAX_MILLIS_BEFORE_GPS_REWAKE_ATTEMPT 5000
+#define PULSE_GPS_ONOFF  GPS_PORT |= (1 << GPS_PIN); delayMicroseconds(100); GPS_PORT &= ~(1 << GPS_PIN);
 
-//Handle errors by printing the error type and blinking LEDs in certain way
-//The function will never exit - it loops forever inside blink_error
-void systemError(byte error_type)
-{
-  NewSerial.print(F("Error "));
-  switch(error_type)
-  {
-  case ERROR_CARD_INIT:
-    NewSerial.print(F("card.init")); 
-    blink_error(ERROR_SD_INIT);
-    break;
-  case ERROR_VOLUME_INIT:
-    NewSerial.print(F("volume.init")); 
-    blink_error(ERROR_SD_INIT);
-    break;
-  case ERROR_ROOT_INIT:
-    NewSerial.print(F("root.init")); 
-    blink_error(ERROR_SD_INIT);
-    break;
-  case ERROR_FILE_OPEN:
-    NewSerial.print(F("file.open")); 
-    blink_error(ERROR_SD_INIT);
-    break;
-  }
-}
+//Blinking LED error codes
+#define ERROR_SD_INIT	  3
+#define ERROR_NEW_BAUD	  5
+#define ERROR_CARD_INIT   6
+#define ERROR_VOLUME_INIT 7
+#define ERROR_ROOT_INIT   8
+#define ERROR_FILE_OPEN   9
+
+//STAT1 is a general LED and indicates serial traffic
+#define STAT1  5 //On PORTD
+#define STAT1_PORT  PORTD
+#define STAT2  5 //On PORTB
+#define STAT2_PORT  PORTB
+const byte statled1 = 5;  //This is the normal status LED
+const byte statled2 = 13; //This is the SPI LED, indicating SD traffic
+
 
 void setup(void)
 {
   pinMode(statled1, OUTPUT);
+  pinMode(gps_pin, OUTPUT);
 
   //Power down various bits of hardware to lower power usage  
   set_sleep_mode(SLEEP_MODE_IDLE);
@@ -291,6 +288,26 @@ void setup(void)
 
   if(setting_ignore_RX == OFF) //If we are NOT ignoring RX, then
     check_emergency_reset(); //Look to see if the RX pin is being pulled low
+    
+  power_timer1_enable();
+  gps_wake_time_millis = gps_next_wake_secs = 0;
+  TCCR1A = 0;
+  TCCR1B = (1 << CS10) | (1 << CS12);
+  TIMSK1 |= (1 << TOIE1);
+}
+
+/*
+ * Interrupt handler for Timer1.
+ * This will be used to shut down the GPS at periodic intervals
+ * to save battery power.
+ */
+ISR(TIMER1_OVF_vect) {
+   TCNT1 = 0xc2f6;  // Fire again in 1sec.
+   if (!gps_next_wake_secs) {
+     gps_wake_time_millis += 1000;
+   } else {
+     gps_next_wake_secs--;
+   }
 }
 
 void loop(void)
@@ -425,6 +442,34 @@ void seqlog(void)
   append_file(sequentialFileName); 
 }
 
+/* Processes a byte of data from the GPS.
+ *
+ * Determines if there is a valid fix. If there are sufficient, then
+ * send a sleep pulse to the GPS and start wake timer.
+ */
+void process_gps(byte c) {
+  float flat, flon;
+  unsigned long age;
+  if (gps.encode(c)) {
+    gps.f_get_position(&flat, &flon, &age);
+    if (age != TinyGPS::GPS_INVALID_AGE && gps.gps_data_good) {
+      NewSerial.println();
+      NewSerial.println(age);
+      gps_fix_count += 1;
+    }
+  }
+  NewSerial.write(&c, 1);
+  // Check if we get enough GPS fixes.
+  if (gps_fix_count > 2) {
+    NewSerial.println("GPS Sleep...");
+    PULSE_GPS_ONOFF;
+    // Set wake for 10s, and reset fix count.
+    gps_next_wake_secs = 60;
+    gps_fix_count = 0;
+    gps_wake_time_millis = 0;
+  }
+}
+
 //This is the most important function of the device. These loops have been tweaked as much as possible.
 //Modifying this loop may negatively affect how well the device can record at high baud rates.
 //Appends a stream of serial data to a given file
@@ -453,19 +498,41 @@ byte append_file(char* file_name)
   const byte LOCAL_BUFF_SIZE = 128; //This is the 2nd buffer. It pulls from the larger NewSerial buffer as quickly as possible.
   byte localBuffer[LOCAL_BUFF_SIZE];
 
-  const uint16_t MAX_IDLE_TIME_MSEC = 500; //The number of milliseconds before unit goes to sleep
+  const uint16_t MAX_IDLE_TIME_MSEC = 2000; //The number of milliseconds before unit goes to sleep
   const uint16_t MAX_TIME_BEFORE_SYNC_MSEC = 5000;
   uint32_t lastSyncTime = millis(); //Keeps track of the last time the file was synced
+  uint32_t lastRxTime = millis(); //Keeps track of the last time data was received
 
   printRam(); //Print the available RAM
+  TCNT1 = 0xc2f6;
 
   //Start recording incoming characters
   while(1) { //Infinite loop
 
+    // Check if time to wake up GPS.
+    if (gps_next_wake_secs == 1) {
+      NewSerial.println("GPS wake...");
+      // Pulse GPS OnOff pin.
+      PULSE_GPS_ONOFF;
+      // Stop GPS wake timer.
+      gps_next_wake_secs = 0;
+      gps_wake_time_millis = 0;
+    } else if (!gps_next_wake_secs && gps_wake_time_millis > MAX_MILLIS_BEFORE_GPS_REWAKE_ATTEMPT &&
+               (millis() - lastRxTime) > MAX_MILLIS_BEFORE_GPS_REWAKE_ATTEMPT) {
+      // If GPS is supposed to be awake, and it's been more than the timeout since
+      // the last chars have been received, attempt to wake again with another pulse.
+      NewSerial.println("Reattempting GPS wake...");
+      PULSE_GPS_ONOFF;
+      gps_wake_time_millis = 0;
+    }
+  
     byte n = NewSerial.read(localBuffer, sizeof(localBuffer)); //Read characters from global buffer into the local buffer
     if (n > 0) {
-      //Scan the local buffer for esacape characters
-      //In the light version of OpenLog, we don't check for escape characters
+      lastRxTime = millis();
+      // Send chars to the GPS routine.
+      for (byte i = 0 ; i < n ; i++) {
+        process_gps(localBuffer[i]);
+      }
 
       workingFile.write(localBuffer, n); //Record the buffer to the card
 
@@ -479,10 +546,9 @@ byte append_file(char* file_name)
         lastSyncTime = millis();
       }
     }
-    //No characters recevied?
-    else if( (millis() - lastSyncTime) > MAX_IDLE_TIME_MSEC) { //If we haven't received any characters in 2s, goto sleep
+    //GPS set to sleep?
+    else if (gps_next_wake_secs) {
       workingFile.sync(); //Sync the card before we go to sleep
-
       STAT1_PORT &= ~(1<<STAT1); //Turn off stat LED to save power
 
       power_timer0_disable(); //Shut down peripherals we don't need
@@ -492,81 +558,16 @@ byte append_file(char* file_name)
       power_spi_enable(); //After wake up, power up peripherals
       power_timer0_enable();
 
-      lastSyncTime = millis(); //Reset the last sync time to now
+      lastRxTime = millis(); //Reset the last sync time to now
     }
   }
 
   return(1); //Success!
 }
 
-//The following are system functions needed for basic operation
-//=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
 
-//Blinks the status LEDs to indicate a type of error
-void blink_error(byte ERROR_TYPE) {
-  while(1) {
-    for(int x = 0 ; x < ERROR_TYPE ; x++) {
-      digitalWrite(statled1, HIGH);
-      delay(200);
-      digitalWrite(statled1, LOW);
-      delay(200);
-    }
 
-    delay(2000);
-  }
-}
-
-//Check to see if we need an emergency UART reset
-//Scan the RX pin for 2 seconds
-//If it's low the entire time, then return 1
-void check_emergency_reset(void)
-{
-  pinMode(0, INPUT); //Turn the RX pin into an input
-  digitalWrite(0, HIGH); //Push a 1 onto RX pin to enable internal pull-up
-
-  //Quick pin check
-  if(digitalRead(0) == HIGH) return;
-
-  //Wait 2 seconds, blinking LEDs while we wait
-  pinMode(statled2, OUTPUT);
-  digitalWrite(statled2, HIGH); //Set the STAT2 LED
-  for(byte i = 0 ; i < 40 ; i++)
-  {
-    delay(25);
-    STAT1_PORT ^= (1<<STAT1); //Blink the stat LEDs
-
-    if(digitalRead(0) == HIGH) return; //Check to see if RX is not low anymore
-
-    delay(25);
-    STAT2_PORT ^= (1<<STAT2); //Blink the stat LEDs
-
-    if(digitalRead(0) == HIGH) return; //Check to see if RX is not low anymore
-  }		
-
-  //If we make it here, then RX pin stayed low the whole time
-  set_default_settings(); //Reset baud, escape characters, escape number, system mode
-
-  //Try to setup the SD card so we can record these new settings
-  if (!card.init()) systemError(ERROR_CARD_INIT);
-  if (!volume.init(&card)) systemError(ERROR_VOLUME_INIT);
-  currentDirectory.close(); //We close the cD before opening root. This comes from QuickStart example. Saves 4 bytes.
-  if (!currentDirectory.openRoot(&volume)) systemError(ERROR_ROOT_INIT);
-
-  record_config_file(); //Record new config settings
-
-  pinMode(statled1, OUTPUT);
-  pinMode(statled2, OUTPUT);
-  digitalWrite(statled1, HIGH);
-  digitalWrite(statled2, HIGH);
-
-  //Now sit in forever loop indicating system is now at 9600bps
-  while(1)
-  {
-    delay(500);
-    STAT1_PORT ^= (1<<STAT1); //Blink the stat LEDs
-    STAT2_PORT ^= (1<<STAT2); //Blink the stat LEDs
-  }
-}
+// Code used for the configuration related functions.
 
 //Resets all the system settings to safe values
 void set_default_settings(void)
@@ -960,6 +961,77 @@ long readBaud(void)
 }
 
 
+//The following are system functions needed for basic operation
+//=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+
+//Blinks the status LEDs to indicate a type of error
+void blink_error(byte ERROR_TYPE) {
+  while(1) {
+    for(int x = 0 ; x < ERROR_TYPE ; x++) {
+      digitalWrite(statled1, HIGH);
+      delay(200);
+      digitalWrite(statled1, LOW);
+      delay(200);
+    }
+
+    delay(2000);
+  }
+}
+
+//Check to see if we need an emergency UART reset
+//Scan the RX pin for 2 seconds
+//If it's low the entire time, then return 1
+void check_emergency_reset(void)
+{
+  pinMode(0, INPUT); //Turn the RX pin into an input
+  digitalWrite(0, HIGH); //Push a 1 onto RX pin to enable internal pull-up
+
+  //Quick pin check
+  if(digitalRead(0) == HIGH) return;
+
+  //Wait 2 seconds, blinking LEDs while we wait
+  pinMode(statled2, OUTPUT);
+  digitalWrite(statled2, HIGH); //Set the STAT2 LED
+  for(byte i = 0 ; i < 40 ; i++)
+  {
+    delay(25);
+    STAT1_PORT ^= (1<<STAT1); //Blink the stat LEDs
+
+    if(digitalRead(0) == HIGH) return; //Check to see if RX is not low anymore
+
+    delay(25);
+    STAT2_PORT ^= (1<<STAT2); //Blink the stat LEDs
+
+    if(digitalRead(0) == HIGH) return; //Check to see if RX is not low anymore
+  }		
+
+  //If we make it here, then RX pin stayed low the whole time
+  set_default_settings(); //Reset baud, escape characters, escape number, system mode
+
+  //Try to setup the SD card so we can record these new settings
+  if (!card.init()) systemError(ERROR_CARD_INIT);
+  if (!volume.init(&card)) systemError(ERROR_VOLUME_INIT);
+  currentDirectory.close(); //We close the cD before opening root. This comes from QuickStart example. Saves 4 bytes.
+  if (!currentDirectory.openRoot(&volume)) systemError(ERROR_ROOT_INIT);
+
+  record_config_file(); //Record new config settings
+
+  pinMode(statled1, OUTPUT);
+  pinMode(statled2, OUTPUT);
+  digitalWrite(statled1, HIGH);
+  digitalWrite(statled2, HIGH);
+
+  //Now sit in forever loop indicating system is now at 9600bps
+  while(1)
+  {
+    delay(500);
+    STAT1_PORT ^= (1<<STAT1); //Blink the stat LEDs
+    STAT2_PORT ^= (1<<STAT2); //Blink the stat LEDs
+  }
+}
+
+
+
 //End core system functions
 //=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
 
@@ -972,4 +1044,48 @@ uint32_t strtolong(const char* str)
     l = l * 10 + (*str++ - '0');
 
   return l;
+}
+
+//Passes back the available amount of free RAM
+int freeRam () 
+{
+#if RAM_TESTING
+  extern int __heap_start, *__brkval; 
+  int v; 
+  return (int) &v - (__brkval == 0 ? (int) &__heap_start : (int) __brkval); 
+#endif
+}
+void printRam() 
+{
+#if RAM_TESTING
+  NewSerial.print(F(" RAM:"));
+  NewSerial.println(freeRam());
+#endif
+}
+
+
+//Handle errors by printing the error type and blinking LEDs in certain way
+//The function will never exit - it loops forever inside blink_error
+void systemError(byte error_type)
+{
+  NewSerial.print(F("Error "));
+  switch(error_type)
+  {
+  case ERROR_CARD_INIT:
+    NewSerial.print(F("card.init")); 
+    blink_error(ERROR_SD_INIT);
+    break;
+  case ERROR_VOLUME_INIT:
+    NewSerial.print(F("volume.init")); 
+    blink_error(ERROR_SD_INIT);
+    break;
+  case ERROR_ROOT_INIT:
+    NewSerial.print(F("root.init")); 
+    blink_error(ERROR_SD_INIT);
+    break;
+  case ERROR_FILE_OPEN:
+    NewSerial.print(F("file.open")); 
+    blink_error(ERROR_SD_INIT);
+    break;
+  }
 }
