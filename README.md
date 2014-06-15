@@ -1,5 +1,29 @@
-OpenLog
-=======
+GpsLogger
+========
+
+This is a fork of the original OpenLog v3 firmware. The purpose of this fork is
+to build a power efficient GPS logger.
+
+This fork only modifies the OpenLog Light firmware.
+
+I originally [built a GPS Logging collar](http://www.buxtronix.net/2011/10/gps-feline-tracker.html) for my cats 
+consisting of a [tiny GPS unit](https://www.sparkfun.com/products/retired/8936) and the OpenLog just logging
+the serial data from the GPS. This proved to be very power inefficient, with the GPS module powered up full
+time. I got about 1.5 hours out of the battery.
+
+This fork of OpenLog allows for very power efficient operation, with a runtime of at least 24 hours. This
+is achieved by waiting for a GPS fix, then putting the GPS module in standby for a time (60s currently). Then
+the module is woken up again, gets another fix, and goes back to sleep. The standby mode of the module
+retains SRAM and satellite sync info, so it takes around 5s to fetch the fix again.
+
+The hardware changes are simple - just a signal from PC1 of the AVR into the OnOff pin of the GPS. Each
+pulse toggles between standby and full power.
+
+This should be adaptable for other GPS modules, as long as putting them into standby mode is
+simple.
+
+Below is the original OpenLog readme...
+
 
 [![OpenLog](https://dlnmh9ip6v2uc.cloudfront.net/images/products/9/5/3/0/09530-01_i_ma.jpg)  
 *OpenLog (DEV-09530)*](https://www.sparkfun.com/products/9530)
